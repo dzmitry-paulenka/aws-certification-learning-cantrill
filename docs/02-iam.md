@@ -98,3 +98,79 @@ region         = eu-central-1
 # check who you are
 aws sts get-caller-identity --profile proj-scratch
 ```
+---
+
+## Managed and inline policies
+
+| | Managed policy | Inline policy |
+|---|---|---|
+| What it is | Its own IAM object, with its own ARN | Part of one user, group or role, no ARN |
+| Reuse | Attach to many identities | Belongs to exactly one |
+| Versions | Up to 5, roll back with `SetDefaultPolicyVersion` | None |
+| In CloudFormation | `ManagedPolicyArns` on the role/user/group, or an `AWS::IAM::ManagedPolicy` resource | the `Policies` property |
+
+Two kinds of managed policy. The ARN tells them apart:
+
+- **AWS managed**: AWS writes and updates them. `arn:aws:iam::aws:policy/AdministratorAccess`
+- **Customer managed**: you write them. `arn:aws:iam::111122223333:policy/MyPolicy`
+
+Limit: 10 managed policies per user or role by default, raisable with a quota request.
+
+### Edits apply everywhere, at once
+
+- Editing a managed policy creates a new version and makes it the default. Every identity it's attached to gets it within seconds.
+- That includes **active role sessions**. IAM checks permissions on every request.
+- You can't pin a version per attachment.
+- AWS edits its own managed policies too, mostly to add actions for new features.
+
+Changing many identities at once is the reason managed policies exist: fix a mistake once, not in 200 inline copies. The risk sits with whoever can edit the policy.
+
+### Breadth is the real risk
+
+AWS editing `AmazonS3ReadOnlyAccess` adds little risk. You already trust AWS to run S3. The policy's breadth is the problem:
+
+```json
+// AmazonS3ReadOnlyAccess, roughly
+{
+  "Effect": "Allow",
+  "Action": ["s3:Get*", "s3:List*", "s3-object-lambda:Get*", "s3-object-lambda:List*"],
+  "Resource": "*"
+}
+```
+
+- **`Resource: "*"`** covers every bucket in the account.
+- **Wildcard actions grow on their own.** A new S3 `Get...` action falls under `s3:Get*` with no policy edit. An inline `s3:Get*` grows the same way.
+- **"ReadOnly" includes data.** `s3:GetObject` reads every object in every bucket.
+
+So the choice that matters is broad vs scoped, more than managed vs inline. A scoped policy lists explicit actions and ARNs, and nothing in it grows until you change it:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["s3:ListBucket"],
+  "Resource": "arn:aws:s3:::my-blog-images"
+},
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject"],
+  "Resource": "arn:aws:s3:::my-blog-images/*"
+}
+```
+
+`ListBucket` acts on the bucket ARN, `GetObject` on the object ARN (`/*`). Mixing them up is a common reason for "access denied".
+
+### Who can edit policies
+
+Editing rights are **permissions on the policy**, not a trust relationship. A trust policy only controls who can assume a role. Actions to restrict:
+
+- `iam:CreatePolicyVersion`, `iam:SetDefaultPolicyVersion`
+- `iam:AttachRolePolicy`, `iam:AttachUserPolicy`, `iam:PutRolePolicy`
+
+These are classic **privilege escalation** paths. A principal that can edit a policy attached to itself can grant itself anything.
+
+Other controls:
+
+- **Stage risky changes.** Attach a new policy to one role, test, then move the rest. Don't edit the shared policy in place.
+- **Check before deploy.** IAM Access Analyzer's `CheckNoNewAccess` compares two policy versions and fails if the new one grants more.
+- **Audit.** CloudTrail logs `CreatePolicyVersion` and `SetDefaultPolicyVersion`.
+- **Cap it.** Permissions boundaries and SCPs limit what any policy can grant.
